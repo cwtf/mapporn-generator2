@@ -1,6 +1,6 @@
 import { computeChoropleth, makeFormatter, SCHEME_NAMES } from '../map/colors';
 import { geo } from '../map/geodata';
-import { PROJECTION_GROUPS, PROJECTION_IDS, PROJECTIONS } from '../map/projections';
+import { canTurn, normalizeAngle, PROJECTION_GROUPS, PROJECTION_IDS, PROJECTIONS } from '../map/projections';
 import { emptyMapState, type ChoroplethMethod, type MapLabel, type MapLine, type MapMarker, type MapState, type MarkerShape } from '../map/types';
 import { useMapStore } from '../store/mapStore';
 import type { ToolDef } from './llm';
@@ -144,6 +144,7 @@ const mapTools: (ToolDef & { run: Executor })[] = [
         projection: { type: 'string', enum: PROJECTION_IDS },
         rotate: { type: 'array', items: { type: 'number' }, description: 'Optional [lambda, phi, gamma] rotation in degrees, e.g. [-150, 0] for a Pacific-centred map, [0, -90] for a north-polar azimuthal view. Omit to auto-centre.' },
         parallels: { type: 'array', items: { type: 'number' }, description: 'Optional standard parallels for conic projections, e.g. [35, 65] for Europe' },
+        angle: { type: 'number', description: 'Optional in-plane rotation of the whole map in degrees, clockwise (e.g. 90 turns north to the right, 180 is a south-up map). Omit to keep the current angle; 0 resets.' },
       },
       required: ['projection'],
     },
@@ -152,15 +153,17 @@ const mapTools: (ToolDef & { run: Executor })[] = [
       if (!PROJECTION_IDS.includes(id)) return `Unknown projection "${a.projection}". Options: ${PROJECTION_IDS.join(', ')}`;
       const rot = Array.isArray(a.rotate) ? a.rotate.map(Number).filter(Number.isFinite) : [];
       const par = Array.isArray(a.parallels) ? a.parallels.map(Number).filter(Number.isFinite) : [];
+      const angle = a.angle === undefined || a.angle === null ? map().projection.angle : normalizeAngle(Number(a.angle)) || undefined;
       update((m) => {
         m.projection = {
           id,
+          ...(angle && Number.isFinite(angle) && canTurn(id) ? { angle } : {}),
           ...(rot.length >= 2 ? { rotate: [rot[0], rot[1], rot[2] ?? 0] as [number, number, number] } : {}),
           ...(par.length === 2 ? { parallels: [par[0], par[1]] as [number, number] } : {}),
         };
         m.view = { k: 1, x: 0, y: 0 };
       });
-      return `Projection set to ${PROJECTIONS[id].label}.`;
+      return `Projection set to ${PROJECTIONS[id].label}${angle && canTurn(id) ? `, rotated ${angle}° clockwise` : ''}.`;
     },
   },
   {
@@ -888,6 +891,7 @@ export function summarizeMap(m: MapState) {
 /** One-line description of the map, attached to each user message so the model notices manual changes. */
 export function briefMapState(m: MapState): string {
   const parts = [`projection=${m.projection.id}`];
+  if (m.projection.angle) parts.push(`rotated ${m.projection.angle}° clockwise`);
   if (m.focus) parts.push(`focus=[${m.focus.join(',')}]`);
   if (m.title) parts.push(`title="${m.title}"`);
   const colored = Object.keys(m.regions).length;

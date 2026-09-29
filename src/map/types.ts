@@ -103,6 +103,8 @@ export interface ProjectionSettings {
   rotate?: [number, number, number?];
   /** Standard parallels for conic projections */
   parallels?: [number, number];
+  /** In-plane rotation of the whole map in degrees, clockwise positive. */
+  angle?: number;
 }
 
 export interface MapState {

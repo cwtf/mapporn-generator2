@@ -21,6 +21,9 @@ const PATHS: Record<string, string> = {
   check: 'M20 6 9 17l-5-5',
   alert: 'M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
   chevron: 'M9 18l6-6-6-6',
+  rotateCcw: 'M1 4v6h6M3.5 15a9 9 0 1 0 2.1-9.4L1 10',
+  rotateCw: 'M23 4v6h-6M20.5 15a9 9 0 1 1-2.1-9.4L23 10',
+  fit: 'M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M16 21h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3',
 };
 
 export function Icon({ name, size = 18, className }: { name: keyof typeof PATHS | string; size?: number; className?: string }) {

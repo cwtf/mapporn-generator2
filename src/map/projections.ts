@@ -9,12 +9,16 @@ import {
   geoEquirectangular,
   geoGnomonic,
   geoMercator,
+  geoMercatorRaw,
   geoNaturalEarth1,
   geoOrthographic,
+  geoProjection,
   geoStereographic,
   geoTransverseMercator,
+  geoTransverseMercatorRaw,
   type GeoPermissibleObjects,
   type GeoProjection,
+  type GeoRawProjection,
 } from 'd3-geo';
 import * as gp from 'd3-geo-projection';
 import * as poly from 'd3-geo-polygon';
@@ -51,12 +55,39 @@ interface ProjectionDef {
   description: string;
   /** Geographic box to frame for the whole-world view instead of the sphere (for projections that blow up at the poles). */
   worldBox?: BBox;
+  /** Variant used when the map is turned (see cappedMercator). */
+  turned?: () => GeoProjection;
 }
 
 /** Geographic box [west, south, east, north]; west > east means it crosses the antimeridian. */
 export type BBox = [number, number, number, number];
 
 export const WORLD_BBOX: BBox = [-180, -58, 180, 84];
+
+/** Latitude (radians) at which d3's square Mercator world ends (y = ±π). */
+const MERCATOR_MAX_LAT = 2 * Math.atan(Math.exp(Math.PI)) - Math.PI / 2;
+
+/**
+ * d3's Mercators put the poles at infinity and crop them with an axis-aligned square in screen
+ * space, which cuts a turned map to an octagon. Capping latitude in the raw projection instead
+ * keeps the world finite, so it turns as a square with nothing to clip.
+ */
+function cappedMercator(raw: GeoRawProjection): GeoRawProjection {
+  const capped: GeoRawProjection = (x, y) => raw(x, Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, y)));
+  capped.invert = raw.invert;
+  return capped;
+}
+
+/** Transverse Mercator is a Mercator rolled 90°; d3 hides that roll inside rotate(), so do the same. */
+function transverse(p: GeoProjection): GeoProjection {
+  const rotate = p.rotate.bind(p) as (r?: [number, number, number]) => [number, number, number];
+  p.rotate = ((r?: [number, number, number?]) => {
+    if (r) return rotate([r[0], r[1], (r[2] ?? 0) + 90]);
+    const [l, f, g] = rotate();
+    return [l, f, g - 90];
+  }) as GeoProjection['rotate'];
+  return p.rotate([0, 0, 0]);
+}
 
 type Factory = () => GeoProjection;
 const G = gp as unknown as Record<string, Factory>;
@@ -66,7 +97,15 @@ const withParam = (make: Factory, name: string, value: number) => () => (make() 
 
 export const PROJECTIONS: Record<string, ProjectionDef> = {
   // ---- Cylindrical --------------------------------------------------------------------
-  mercator: { label: 'Mercator', group: 'Cylindrical', kind: 'cylindrical', make: geoMercator, worldBox: WORLD_BBOX, description: 'Conformal; the web-map default. Inflates high latitudes.' },
+  mercator: {
+    label: 'Mercator',
+    group: 'Cylindrical',
+    kind: 'cylindrical',
+    make: geoMercator,
+    turned: () => geoProjection(cappedMercator(geoMercatorRaw)),
+    worldBox: WORLD_BBOX,
+    description: 'Conformal; the web-map default. Inflates high latitudes.',
+  },
   equirectangular: { label: 'Equirectangular (Plate Carrée)', group: 'Cylindrical', kind: 'cylindrical', make: geoEquirectangular, description: 'Simple lat/lon grid.' },
   miller: { label: 'Miller', group: 'Cylindrical', kind: 'cylindrical', make: G.geoMiller, worldBox: WORLD_BBOX, description: 'Mercator-like with less polar inflation.' },
   gallStereographic: { label: 'Gall Stereographic', group: 'Cylindrical', kind: 'cylindrical', make: withParam(G.geoCylindricalStereographic, 'parallel', 45), description: 'Compromise cylindrical used in atlases.' },
@@ -160,6 +199,7 @@ export const PROJECTIONS: Record<string, ProjectionDef> = {
     group: 'Conic & regional',
     kind: 'regional',
     make: geoTransverseMercator,
+    turned: () => transverse(geoProjection(cappedMercator(geoTransverseMercatorRaw))),
     worldBox: [-75, -80, 75, 80],
     description: 'For tall, narrow regions (Chile, Japan, UTM zones).',
   },
@@ -186,6 +226,15 @@ export function projectionDef(id: ProjectionId): ProjectionDef {
 
 /** Projections the user rotates by dragging instead of panning. */
 export const isRotatable = (id: ProjectionId) => projectionDef(id).kind === 'azimuthal';
+
+/** Albers USA is a composite without a planar angle, so it can't be turned. */
+export const canTurn = (id: ProjectionId) => projectionDef(id).kind !== 'composite';
+
+/** Normalise an angle in degrees to (-180, 180]. */
+export function normalizeAngle(a: number): number {
+  const r = ((((a + 180) % 360) + 360) % 360) - 180;
+  return r === -180 ? 180 : r;
+}
 
 /** A grid of points covering a bbox; fitting to it frames the bbox in any projection. */
 function bboxPoints([w, s, e, n]: BBox): GeoPermissibleObjects {
@@ -222,7 +271,7 @@ export interface Frame {
  */
 export function buildProjection(settings: ProjectionSettings, frame: Frame, bbox?: BBox, usaFeature?: GeoPermissibleObjects): GeoProjection {
   const def = projectionDef(settings.id);
-  const p = def.make();
+  const p = settings.angle && def.turned ? def.turned() : def.make();
   const extent: [[number, number], [number, number]] = [
     [frame.x0, frame.y0],
     [frame.x1, frame.y1],
@@ -236,6 +285,10 @@ export function buildProjection(settings: ProjectionSettings, frame: Frame, bbox
   const isWorld = !bbox;
   const box = bbox ?? def.worldBox ?? WORLD_BBOX;
   const [clon, clat] = bboxCenter(box);
+
+  // d3's angle() is counterclockwise-positive; ours is clockwise. Applied before fitting so the
+  // rotated map is re-fitted to the frame.
+  if (settings.angle && typeof p.angle === 'function') p.angle(-settings.angle);
 
   if (settings.rotate) {
     p.rotate([settings.rotate[0], settings.rotate[1], settings.rotate[2] ?? 0]);

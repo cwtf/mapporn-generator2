@@ -5,15 +5,17 @@ import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from 'd3-zoom
 import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useMapStore } from '../store/mapStore';
 import { useTheme } from '../store/theme';
+import { Icon } from '../components/Icon';
 import { computeChoropleth, makeFormatter, resolveStyle, type ChoroplethLegend, type ResolvedStyle } from './colors';
 import { geo } from './geodata';
 import { Legend } from './Legend';
-import { buildProjection, isRotatable, projectionDef, type Frame } from './projections';
+import { buildProjection, canTurn, isRotatable, normalizeAngle, projectionDef, type Frame } from './projections';
 import { MAP_HEIGHT as H, MAP_WIDTH as W, type MapLine, type MapState, type MapView as View, type MarkerShape } from './types';
 
 export const mapSvgRef: { current: SVGSVGElement | null } = { current: null };
 
 const MAX_ZOOM = 60;
+const TURN_STEP = 15;
 
 interface PathItem {
   id: string;
@@ -157,6 +159,29 @@ export function MapView() {
     setView({ k: 1, x: 0, y: 0 });
   };
 
+  // ---- in-plane rotation ------------------------------------------------------
+  const angle = map.projection.angle ?? 0;
+  const turnable = canTurn(map.projection.id);
+  const turnTo = (deg: number) => {
+    const next = { ...useMapStore.getState().map.projection, angle: normalizeAngle(deg) || undefined };
+    let view: View = { k: 1, x: 0, y: 0 };
+    if (t.k !== 1 || t.x || t.y) {
+      // Keep whatever is at the centre of the screen there, so a zoomed-in view turns in place.
+      view = t;
+      const ll = projection.invert?.([(W / 2 - t.x) / t.k, (H / 2 - t.y) / t.k]);
+      const q = ll && buildProjection(next, frame, map.focus, geo.get('USA')?.feature)(ll);
+      if (q && Number.isFinite(q[0]) && Number.isFinite(q[1])) view = { k: t.k, x: W / 2 - q[0] * t.k, y: H / 2 - q[1] * t.k };
+      const svg = svgRef.current;
+      if (svg && zoomRef.current) select(svg).call(zoomRef.current.transform, zoomIdentity.translate(view.x, view.y).scale(view.k));
+    }
+    useMapStore.getState().update((m) => {
+      m.projection = next;
+      m.view = view;
+    });
+  };
+  // Read the angle from the store so rapid clicks don't act on a stale render.
+  const turnBy = (deg: number) => turnTo((useMapStore.getState().map.projection.angle ?? 0) + deg);
+
   // Globe drag-to-rotate
   const drag = useRef<{ x: number; y: number; rot: [number, number, number]; scale: number } | null>(null);
   const onPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -170,9 +195,15 @@ export function MapView() {
     const d = drag.current;
     if (d) {
       const degPerPx = (180 / Math.PI / (projection.scale() * t.k)) * d.scale;
+      // Undo the map's in-plane angle so dragging follows the pointer on a turned globe.
+      const a = (angle * Math.PI) / 180;
+      const sx = e.clientX - d.x;
+      const sy = e.clientY - d.y;
+      const dx = sx * Math.cos(a) + sy * Math.sin(a);
+      const dy = sy * Math.cos(a) - sx * Math.sin(a);
       const rot: [number, number, number] = [
-        d.rot[0] + (e.clientX - d.x) * degPerPx,
-        Math.max(-90, Math.min(90, d.rot[1] - (e.clientY - d.y) * degPerPx)),
+        d.rot[0] + dx * degPerPx,
+        Math.max(-90, Math.min(90, d.rot[1] - dy * degPerPx)),
         d.rot[2],
       ];
       cancelAnimationFrame(rafRef.current);
@@ -236,16 +267,33 @@ export function MapView() {
           {tooltip.value && <div>{tooltip.value}</div>}
         </div>
       )}
-      <div className="zoom-controls" data-export="exclude">
-        <button type="button" title="Zoom in" aria-label="Zoom in" onClick={() => zoomBy(1.6)}>
-          +
-        </button>
-        <button type="button" title="Zoom out" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.6)}>
-          −
-        </button>
-        <button type="button" title="Reset zoom" aria-label="Reset zoom" onClick={resetZoom}>
-          ⟲
-        </button>
+      <div className="map-controls" data-export="exclude">
+        {turnable && (
+          <div className="zoom-controls">
+            <button type="button" title="Rotate counterclockwise" aria-label="Rotate counterclockwise" onClick={() => turnBy(-TURN_STEP)}>
+              <Icon name="rotateCcw" />
+            </button>
+            {angle !== 0 && (
+              <button type="button" className="angle" title="Reset rotation" aria-label={`Rotated ${angle}°, reset rotation`} onClick={() => turnTo(0)}>
+                {Math.round(angle)}°
+              </button>
+            )}
+            <button type="button" title="Rotate clockwise" aria-label="Rotate clockwise" onClick={() => turnBy(TURN_STEP)}>
+              <Icon name="rotateCw" />
+            </button>
+          </div>
+        )}
+        <div className="zoom-controls">
+          <button type="button" title="Zoom in" aria-label="Zoom in" onClick={() => zoomBy(1.6)}>
+            +
+          </button>
+          <button type="button" title="Zoom out" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.6)}>
+            −
+          </button>
+          <button type="button" title="Reset zoom" aria-label="Reset zoom" onClick={resetZoom}>
+            <Icon name="fit" />
+          </button>
+        </div>
       </div>
     </div>
   );

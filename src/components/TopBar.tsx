@@ -29,7 +29,8 @@ export function TopBar({ onSettings, sidebarOpen, onToggleSidebar }: { onSetting
 
   const setProjection = (id: ProjectionId) =>
     update((m) => {
-      m.projection = { id };
+      // Keep the user's in-plane rotation across projection changes.
+      m.projection = { id, angle: m.projection.angle };
       m.view = { k: 1, x: 0, y: 0 };
     });
 
