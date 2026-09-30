@@ -21,6 +21,8 @@ There is no test suite or linter; `npm run typecheck` is the correctness check. 
 
 ## Architecture
 
+**Deployment:** `server/app.ts` builds the Express app; `server/index.ts` adds static serving and `listen` for `npm start`, and `api/index.ts` re-exports the app as the Vercel function (`vercel.json` rewrites `/api/*` to it; Vite output in `dist/` is served by Vercel's CDN).
+
 **The agent loop runs in the browser, not the server.** `src/agent/agent.ts` (`runAgent`) calls the LLM, executes tool calls one at a time in order, and loops until the model stops calling tools or `maxSteps` is hit. The server is only a relay (`/api/llm/chat`, `/api/llm/models`) and a host for research tools (`/api/tools/:name`) — it exists to avoid CORS and attach provider auth headers.
 
 **Two kinds of tools, both declared in `src/agent/tools.ts`:**
@@ -44,6 +46,6 @@ There is no test suite or linter; `npm run typecheck` is the correctness check. 
 ## Conventions and constraints
 
 - Server code uses NodeNext resolution: relative imports need `.js` extensions (`./research.js`). Front-end uses bundler resolution without extensions.
-- The server binds to `127.0.0.1` by default because the LLM relay forwards to user-supplied URLs. Research fetches go through `safeGet` in `server/net.ts`, which rejects private/loopback addresses and caps response size. Any fetch to a URL the agent supplies must use it.
+- The server binds to `127.0.0.1` by default because the LLM relay forwards to user-supplied URLs. `assertAllowed` in `server/app.ts` restricts relay targets to `MAPGEN_ALLOWED_PROVIDERS`, which defaults to unrestricted locally and to the hosted provider presets on Vercel (`VERCEL` env set). Research fetches go through `safeGet` in `server/net.ts`, which rejects private/loopback addresses and caps response size. Any fetch to a URL the agent supplies must use it.
 - Nominatim geocoding is rate-limited to 1 req/s (`nominatimSlot` in `server/research.ts`); research results are cached in memory for 10 minutes.
 - API keys and provider profiles live in browser localStorage (`src/store/settings.ts`, zustand `persist`); the server never stores them.

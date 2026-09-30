@@ -20,6 +20,14 @@ npm run build
 npm start
 ```
 
+## Deploying to Vercel
+
+Import the repository in Vercel (or run `vercel deploy`); `vercel.json` has the settings. The front end is served from `dist/` and every `/api/*` request goes to `api/index.ts`, which runs the same Express app as `npm start`.
+
+On Vercel the LLM relay only forwards to the hosted providers in the settings presets (Anthropic, OpenAI, OpenRouter, Gemini, DeepSeek, Mistral, Groq, xAI, Together), over HTTPS, so the deployment can't be used as an open proxy. To change the list, set the `MAPGEN_ALLOWED_PROVIDERS` environment variable to comma-separated hostnames (`*` disables the check). Local providers such as Ollama can't be reached from a hosted deployment anyway.
+
+Vercel limits requests to 4.5 MB, so very long chats may eventually fail to send; start a new chat if that happens.
+
 ## Features
 
 - **Map** — 77 projections in eight families, Mercator by default:
@@ -62,5 +70,5 @@ The agent loop runs in the browser; map tools edit the map state directly. LLM r
 ## Notes
 
 - API keys are stored in the browser's localStorage and sent only to the provider you configure, via the local server.
-- The server listens on `127.0.0.1` by default because the LLM relay forwards to user-supplied URLs. Set `HOST`/`PORT` to change this; don't expose it publicly without adding authentication. Agent-driven web fetches refuse private and loopback addresses.
+- The server listens on `127.0.0.1` by default because the LLM relay forwards to user-supplied URLs. Set `HOST`/`PORT` to change this. If you expose it, set `MAPGEN_ALLOWED_PROVIDERS` (see below). Agent-driven web fetches refuse private and loopback addresses.
 - Map data: [Natural Earth](https://www.naturalearthdata.com/) (public domain). Geocoding: © OpenStreetMap contributors via Nominatim (1 request/second).
