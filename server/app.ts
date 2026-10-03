@@ -1,5 +1,6 @@
 import express from 'express';
 import { Readable } from 'node:stream';
+import { dataTools } from './data.js';
 import { researchTools } from './research.js';
 
 // The LLM relay forwards to user-supplied base URLs, so a publicly reachable server would be
@@ -129,6 +130,17 @@ app.post('/api/tools/:name', async (req, res) => {
   if (!tool) return void res.status(404).json({ error: `Unknown tool ${req.params.name}` });
   try {
     res.json({ result: await tool(req.body ?? {}) });
+  } catch (e) {
+    res.json({ error: (e as Error).message });
+  }
+});
+
+// Bulk data for map tools (elevation grids, GeoJSON); JSON results that go to the map, not the model.
+app.post('/api/data/:name', async (req, res) => {
+  const loader = dataTools[req.params.name];
+  if (!loader) return void res.status(404).json({ error: `Unknown data source ${req.params.name}` });
+  try {
+    res.json({ result: await loader(req.body ?? {}) });
   } catch (e) {
     res.json({ error: (e as Error).message });
   }

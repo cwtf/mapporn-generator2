@@ -1,4 +1,4 @@
-import { geoDistance, geoGraticule10, geoInterpolate, geoPath, type GeoPermissibleObjects, type GeoProjection, type GeoStream } from 'd3-geo';
+import { geoContains, geoDistance, geoGraticule10, geoInterpolate, geoPath, type GeoPermissibleObjects, type GeoProjection, type GeoStream } from 'd3-geo';
 import { select } from 'd3-selection';
 import 'd3-transition';
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from 'd3-zoom';
@@ -7,10 +7,12 @@ import { useMapStore } from '../store/mapStore';
 import { useTheme } from '../store/theme';
 import { Icon } from '../components/Icon';
 import { computeChoropleth, makeFormatter, resolveStyle, type ChoroplethLegend, type ResolvedStyle } from './colors';
+import { fieldValueAt, renderField, type FieldRender } from './field';
 import { geo } from './geodata';
+import { outline } from './shapes';
 import { Legend } from './Legend';
 import { buildProjection, canTurn, isRotatable, normalizeAngle, projectionDef, type Frame } from './projections';
-import { MAP_HEIGHT as H, MAP_WIDTH as W, type MapLine, type MapState, type MapView as View, type MarkerShape } from './types';
+import { MAP_HEIGHT as H, MAP_WIDTH as W, type ClipMode, type MapArea, type MapLine, type MapState, type MapView as View, type MarkerShape } from './types';
 
 export const mapSvgRef: { current: SVGSVGElement | null } = { current: null };
 
@@ -22,6 +24,25 @@ interface PathItem {
   d: string;
   country?: string;
 }
+
+/** Field bands and free-form areas, projected. */
+interface Surface {
+  bands: { d: string; color: string }[];
+  fieldClip: ClipMode;
+  fieldOpacity?: number;
+  /** `edge` strokes polygons without their seam/pole edges */
+  areas: { area: MapArea; d: string; edge?: string }[];
+}
+
+interface Hover {
+  x: number;
+  y: number;
+  id?: string;
+  value?: string;
+  areas?: string[];
+}
+
+const clipUrl = (c: ClipMode | undefined) => (c === 'land' || c === 'ocean' ? `url(#clip-${c})` : undefined);
 
 function useGeoVersion() {
   return useSyncExternalStore(
@@ -45,7 +66,7 @@ export function MapView() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string>();
   const [t, setT] = useState<View>(map.view);
-  const [hover, setHover] = useState<{ id: string; x: number; y: number }>();
+  const [hover, setHover] = useState<Hover>();
   const geoVersion = useGeoVersion();
 
   useEffect(() => {
@@ -95,6 +116,30 @@ export function MapView() {
     for (const s of subPaths) out[s.id] = fillOf(s.id) ?? map.regions[s.country!]?.fill ?? (choro ? noData : style.land);
     return out;
   }, [countryPaths, subPaths, map.regions, choro, map.choropleth?.noDataColor, style.land]);
+
+  // ---- borderless layers: field + areas ---------------------------------------
+  const field = useMemo<FieldRender | undefined>(() => (map.field ? renderField(map.field) : undefined), [map.field]);
+  // Bands come from a coarse grid, so a tenth of a map unit is plenty and keeps the SVG light.
+  const bandPath = useMemo(() => geoPath(projection).digits(1), [projection]);
+  const bandPaths = useMemo(() => field?.bands.map((b) => ({ d: bandPath(b.geometry) ?? '', color: b.color })) ?? [], [field, bandPath]);
+  const areaPaths = useMemo(
+    () =>
+      map.areas.map((area) => {
+        const g = area.geometry;
+        const polygon = g.type === 'Polygon' || g.type === 'MultiPolygon';
+        return { area, d: path(g) ?? '', edge: area.stroke && polygon ? (path(outline(g)) ?? '') : undefined };
+      }),
+    [map.areas, path],
+  );
+  const surface = useMemo<Surface | undefined>(
+    () =>
+      bandPaths.length || areaPaths.length
+        ? { bands: bandPaths, fieldClip: map.field?.clip ?? 'none', fieldOpacity: map.field?.opacity, areas: areaPaths }
+        : undefined,
+    [bandPaths, areaPaths, map.field?.clip, map.field?.opacity],
+  );
+  const needsLand = !!surface && [surface.bands.length ? surface.fieldClip : 'none', ...surface.areas.map((a) => a.area.clip)].some((c) => c === 'land' || c === 'ocean');
+  const landPath = useMemo(() => (needsLand ? countryPaths.map((c) => c.d).join('') : ''), [needsLand, countryPaths]);
 
   // ---- zoom & pan -----------------------------------------------------------
   const viewTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -216,9 +261,30 @@ export function MapView() {
     }
     const target = e.target as SVGElement;
     const id = target.dataset?.id;
-    if (id) {
+    const next: Hover = { x: 0, y: 0, id };
+    const labelled = map.areas.filter((a) => a.label && a.fill !== 'none');
+    if ((field || labelled.length) && projection.invert) {
+      // Field value and areas under the pointer; clipped layers only count where they are drawn.
+      const q = new DOMPoint(e.clientX, e.clientY).matrixTransform(e.currentTarget.getScreenCTM()!.inverse());
+      const px: [number, number] = [(q.x - t.x) / t.k, (q.y - t.y) / t.k];
+      const ll = projection.invert(px);
+      // Off the globe or in the gap of an interrupted projection, invert() still answers; reject it.
+      const back = ll && Number.isFinite(ll[0]) && Number.isFinite(ll[1]) ? projection(ll) : null;
+      const shown = (clip?: ClipMode) => !clip || clip === 'none' || (clip === 'land') === !!id;
+      if (ll && back && Math.hypot(back[0] - px[0], back[1] - px[1]) < 1) {
+        const v = field && shown(map.field!.clip) ? fieldValueAt(field, ll[0], ll[1]) : undefined;
+        if (v !== undefined) {
+          const f = map.field!;
+          const text = makeFormatter([field!.min, field!.max], f.format, f.unit)(v);
+          next.value = f.title ? `${f.title}: ${text}` : text;
+        }
+        const inside = labelled.filter((a) => shown(a.clip) && /Polygon/.test(a.geometry.type) && geoContains(a.geometry, ll)).map((a) => a.label!);
+        if (inside.length) next.areas = [...new Set(inside)];
+      }
+    }
+    if (next.id || next.value || next.areas) {
       const box = e.currentTarget.parentElement!.getBoundingClientRect();
-      setHover({ id, x: e.clientX - box.left, y: e.clientY - box.top });
+      setHover({ ...next, x: e.clientX - box.left, y: e.clientY - box.top });
     } else if (hover) setHover(undefined);
   };
   const onPointerUp = () => {
@@ -228,7 +294,8 @@ export function MapView() {
   // ---- overlay projection (screen space, includes zoom) ----------------------
   const overlay = useMemo(() => screenSpace(projection, t), [projection, t]);
 
-  const tooltip = hover ? tooltipFor(hover.id, map) : undefined;
+  const tooltip = hover?.id ? tooltipFor(hover.id, map) : undefined;
+  const autoLegends = [choro?.legend, field?.scale.legend].filter((l): l is ChoroplethLegend => !!l);
 
   return (
     <div className="map-wrap" style={{ background: style.background }}>
@@ -255,16 +322,26 @@ export function MapView() {
             fills={fills}
             style={style}
             subdividedCountries={map.subdivisions}
+            surface={surface}
+            landPath={landPath}
           />
         </g>
         <Overlay map={map} screen={overlay} style={style} />
-        <Chrome map={map} style={style} legend={choro?.legend} frame={frame} />
+        <Chrome map={map} style={style} legends={autoLegends} frame={frame} />
       </svg>
-      {tooltip && (
-        <div className="map-tooltip" style={{ left: hover!.x + 14, top: hover!.y + 14 }}>
-          <strong>{tooltip.name}</strong> <span className="muted">{hover!.id}</span>
-          {tooltip.parent && <div className="muted">{tooltip.parent}</div>}
-          {tooltip.value && <div>{tooltip.value}</div>}
+      {hover && (tooltip || hover.value || hover.areas) && (
+        <div className="map-tooltip" style={{ left: hover.x + 14, top: hover.y + 14 }}>
+          {tooltip && (
+            <>
+              <strong>{tooltip.name}</strong> <span className="muted">{hover.id}</span>
+              {tooltip.parent && <div className="muted">{tooltip.parent}</div>}
+              {tooltip.value && <div>{tooltip.value}</div>}
+            </>
+          )}
+          {hover.areas?.map((a) => (
+            <div key={a}>{a}</div>
+          ))}
+          {hover.value && <div>{hover.value}</div>}
         </div>
       )}
       <div className="map-controls" data-export="exclude">
@@ -318,9 +395,12 @@ interface BaseProps {
   fills: Record<string, string>;
   style: ResolvedStyle;
   subdividedCountries: string[];
+  surface?: Surface;
+  /** All visible land as one path, for clipping fields and areas */
+  landPath: string;
 }
 
-const BaseLayer = memo(function BaseLayer({ sphere, graticule, countries, subdivisions, fills, style, subdividedCountries }: BaseProps) {
+const BaseLayer = memo(function BaseLayer({ sphere, graticule, countries, subdivisions, fills, style, subdividedCountries, surface, landPath }: BaseProps) {
   const sub = new Set(subdividedCountries);
   return (
     <>
@@ -338,7 +418,24 @@ const BaseLayer = memo(function BaseLayer({ sphere, graticule, countries, subdiv
           ))}
         </g>
       )}
-      {subdivisions.length > 0 && (
+      {surface && <SurfaceLayer surface={surface} landPath={landPath} />}
+      {surface ? (
+        // Borders go back on top of fields and areas so the map stays readable.
+        <g fill="none" pointerEvents="none" strokeLinejoin="round">
+          {subdivisions.length > 0 && (
+            <g stroke={style.subdivisionBorder} strokeWidth={style.borderWidth * 0.6}>
+              {subdivisions.map((s) => (
+                <path key={s.id} d={s.d} vectorEffect="non-scaling-stroke" />
+              ))}
+            </g>
+          )}
+          <g stroke={style.border} strokeWidth={style.borderWidth}>
+            {countries.map((c) => (
+              <path key={c.id} d={c.d} vectorEffect="non-scaling-stroke" />
+            ))}
+          </g>
+        </g>
+      ) : subdivisions.length > 0 && (
         // Redraw national borders of subdivided countries on top so they stay crisp.
         <g fill="none" stroke={style.border} strokeWidth={style.borderWidth} pointerEvents="none">
           {countries
@@ -351,6 +448,60 @@ const BaseLayer = memo(function BaseLayer({ sphere, graticule, countries, subdiv
     </>
   );
 });
+
+function SurfaceLayer({ surface, landPath }: { surface: Surface; landPath: string }) {
+  const hatchColors = [...new Set(surface.areas.filter((a) => a.area.hatch && a.area.fill && a.area.fill !== 'none').map((a) => a.area.fill!))];
+  return (
+    <g pointerEvents="none">
+      <defs>
+        {landPath && (
+          <>
+            <clipPath id="clip-land">
+              <path d={landPath} />
+            </clipPath>
+            <clipPath id="clip-ocean">
+              <path d={`M-1e5,-1e5H1e5V1e5H-1e5Z${landPath}`} clipRule="evenodd" />
+            </clipPath>
+          </>
+        )}
+        {hatchColors.map((c, i) => (
+          <pattern key={c} id={`hatch-${i}`} patternUnits="userSpaceOnUse" width={7} height={7} patternTransform="rotate(45)">
+            <rect width={2.6} height={7} fill={c} />
+          </pattern>
+        ))}
+      </defs>
+      {surface.bands.length > 0 && (
+        <g clipPath={clipUrl(surface.fieldClip)} opacity={surface.fieldOpacity}>
+          {surface.bands.map((b, i) => (
+            // A hairline in the band colour hides anti-aliasing seams between stacked bands.
+            <path key={i} d={b.d} fill={b.color} stroke={b.color} strokeWidth={0.4} vectorEffect="non-scaling-stroke" />
+          ))}
+        </g>
+      )}
+      {surface.areas.map(({ area: a, d, edge }) => {
+        const fill = !a.fill || a.fill === 'none' ? 'none' : a.hatch ? `url(#hatch-${hatchColors.indexOf(a.fill)})` : a.fill;
+        const width = a.strokeWidth ?? 1.5;
+        return (
+          <g key={a.id} clipPath={clipUrl(a.clip)}>
+            {fill !== 'none' && <path d={d} fill={fill} fillOpacity={a.opacity} />}
+            {a.stroke && (
+              <path
+                d={edge ?? d}
+                fill="none"
+                stroke={a.stroke}
+                strokeWidth={width}
+                strokeDasharray={a.dashed ? `${width * 4} ${width * 2.5}` : undefined}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </g>
+        );
+      })}
+    </g>
+  );
+}
 
 interface ScreenSpace {
   /** project lon/lat to screen (viewBox) coordinates, or null when not visible */
@@ -547,7 +698,7 @@ function markerPath(shape: MarkerShape, r: number): string {
 
 // ---- title, legend, source ----------------------------------------------------------
 
-function Chrome({ map, style, legend, frame }: { map: MapState; style: ResolvedStyle; legend?: ChoroplethLegend; frame: Frame }) {
+function Chrome({ map, style, legends, frame }: { map: MapState; style: ResolvedStyle; legends: ChoroplethLegend[]; frame: Frame }) {
   // A halo in the background colour keeps text legible when the zoomed map slides under it.
   return (
     <g stroke={style.background} strokeLinejoin="round" paintOrder="stroke">
@@ -566,7 +717,7 @@ function Chrome({ map, style, legend, frame }: { map: MapState; style: ResolvedS
           {map.source}
         </text>
       )}
-      <Legend map={map} style={style} choro={legend} top={frame.y0} bottom={frame.y1} />
+      <Legend map={map} style={style} auto={legends} top={frame.y0} bottom={frame.y1} />
     </g>
   );
 }

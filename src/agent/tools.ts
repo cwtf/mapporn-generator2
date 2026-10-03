@@ -1,7 +1,22 @@
-import { computeChoropleth, makeFormatter, SCHEME_NAMES } from '../map/colors';
+import type { Geometry } from 'geojson';
+import { CATEGORICAL, computeChoropleth, makeFormatter, SCHEME_NAMES } from '../map/colors';
+import { renderField } from '../map/field';
 import { geo } from '../map/geodata';
 import { canTurn, normalizeAngle, PROJECTION_GROUPS, PROJECTION_IDS, PROJECTIONS } from '../map/projections';
-import { emptyMapState, type ChoroplethMethod, type MapLabel, type MapLine, type MapMarker, type MapState, type MarkerShape } from '../map/types';
+import { bboxPolygon, circlePolygon, mergeGeometries, normalizeGeometry, polygonFromRings, vertexCount, type AreaGeometry } from '../map/shapes';
+import {
+  emptyMapState,
+  type ChoroplethMethod,
+  type ClipMode,
+  type ColorScale,
+  type FieldData,
+  type MapArea,
+  type MapLabel,
+  type MapLine,
+  type MapMarker,
+  type MapState,
+  type MarkerShape,
+} from '../map/types';
 import { useMapStore } from '../store/mapStore';
 import type { ToolDef } from './llm';
 
@@ -63,6 +78,101 @@ function coord(v: unknown): [number, number] | undefined {
 }
 
 const round = (n: number) => Math.round(n * 1000) / 1000;
+
+function bbox(v: unknown): [number, number, number, number] | undefined {
+  if (!Array.isArray(v) || v.length !== 4) return undefined;
+  const b = v.map(toNum);
+  if (!b.every((x): x is number => x !== undefined) || b[1] >= b[3] || Math.abs(b[1]) > 90 || Math.abs(b[3]) > 90) return undefined;
+  return [b[0], b[1], b[2], b[3]];
+}
+
+const CLIPS: ClipMode[] = ['land', 'ocean', 'none'];
+const clipMode = (v: unknown, dflt: ClipMode): ClipMode => (CLIPS.includes(v as ClipMode) ? (v as ClipMode) : dflt);
+const METHODS: ChoroplethMethod[] = ['quantize', 'quantile', 'threshold', 'continuous'];
+const numList = (v: unknown) => (Array.isArray(v) ? v.map(toNum).filter((x): x is number => x !== undefined) : undefined);
+
+/** Colour-scale arguments shared by set_choropleth and set_field. */
+function colorScaleArgs(a: Args, dflt: { scheme: string; method: ChoroplethMethod }): ColorScale {
+  const domain = numList(a.domain);
+  const colors = Array.isArray(a.colors) ? a.colors.filter(validColor).map((c) => String(c).trim()) : undefined;
+  return {
+    scheme: optStr(a.scheme) ?? dflt.scheme,
+    method: METHODS.includes(a.method as ChoroplethMethod) ? (a.method as ChoroplethMethod) : dflt.method,
+    classes: toNum(a.classes),
+    breaks: numList(a.breaks),
+    colors: colors?.length ? colors : undefined,
+    domain: domain?.length === 2 ? [domain[0], domain[1]] : undefined,
+    reverse: a.reverse === true,
+    title: optStr(a.title),
+    unit: optStr(a.unit),
+    format: optStr(a.format),
+  };
+}
+
+const COLOR_SCALE_PARAMS = {
+  scheme: { type: 'string', description: `One of: ${SCHEME_NAMES.join(', ')}` },
+  method: { type: 'string', enum: METHODS },
+  classes: { type: 'integer', description: 'Number of classes for quantize/quantile (2-9, default 5)' },
+  breaks: { type: 'array', items: { type: 'number' }, description: 'Class breaks for method=threshold, ascending' },
+  colors: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Exact colours overriding scheme: one per class (breaks + 1) for classed methods, gradient stops for continuous',
+  },
+  domain: { type: 'array', items: { type: 'number' }, description: 'Optional [min, max] override' },
+  reverse: { type: 'boolean' },
+  unit: { type: 'string', description: 'Unit appended to legend numbers, e.g. "%", "$", "°C", "mm"' },
+  format: { type: 'string', description: 'd3-format specifier for legend numbers, e.g. ",.0f", ".1f", ".2s"' },
+};
+
+/** Browser-side call to the server's bulk data loaders (results go to the map, not the model). */
+async function loadData<T>(name: string, args: Args, signal: AbortSignal): Promise<T> {
+  const res = await fetch(`/api/data/${name}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(args),
+    signal,
+  });
+  const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (data.error) throw new Error(data.error);
+  return data.result as T;
+}
+
+/** Rings from [[lon, lat], …] (one ring) or [[[lon, lat], …], …] (outline + holes). */
+function rings(v: unknown): [number, number][][] | undefined {
+  if (!Array.isArray(v) || !v.length) return undefined;
+  const nested = Array.isArray(v[0]) && Array.isArray(v[0][0]);
+  const list = (nested ? v : [v]) as unknown[];
+  const out = list.map((r) => (Array.isArray(r) ? r.map(coord).filter(Boolean) : [])) as [number, number][][];
+  return out[0]?.length >= 3 ? out : undefined;
+}
+
+let fieldSeq = 0;
+
+const NATURAL_EARTH = 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/';
+
+type AreaStyle = Omit<MapArea, 'id' | 'geometry'>;
+
+const AREA_STYLE_PARAMS = {
+  fill: { type: 'string', description: 'CSS colour, or "none" for an outline only' },
+  opacity: { type: 'number', description: 'Fill opacity 0–1 (default 1); ~0.5 lets country colours show through' },
+  stroke: { type: 'string', description: 'Outline colour (default none)' },
+  stroke_width: { type: 'number' },
+  dashed: { type: 'boolean' },
+  hatch: { type: 'boolean', description: 'Diagonal hatching instead of a solid fill, good for overlapping zones' },
+  clip: { type: 'string', enum: CLIPS, description: 'land (default for hand-drawn areas), ocean, or none (default for GeoJSON)' },
+  smooth: { type: 'boolean', description: 'Round the corners of hand-drawn outlines' },
+};
+
+interface GeojsonResult {
+  total: number;
+  matched: number;
+  skipped: number;
+  truncated?: boolean;
+  geometryTypes: string[];
+  properties: Record<string, unknown>;
+  features: { properties: Record<string, unknown>; geometry: Geometry }[];
+}
 
 /** Conventional framings for continent maps (full extents are dominated by Russia, overseas territories, etc.) */
 const CONTINENT_FRAMES: Record<string, [number, number, number, number]> = {
@@ -232,7 +342,8 @@ const mapTools: (ToolDef & { run: Executor })[] = [
     name: 'set_choropleth',
     description:
       `Colour regions by numeric value with an automatic colour scale and legend (replaces any previous choropleth). ${REGION_REF_HELP} ` +
-      `Schemes: ${SCHEME_NAMES.join(', ')}. Methods: quantize (equal intervals), quantile (equal counts), threshold (explicit breaks), continuous (smooth gradient).`,
+      `Schemes: ${SCHEME_NAMES.join(', ')}. Methods: quantize (equal intervals), quantile (equal counts), threshold (explicit breaks), continuous (smooth gradient). ` +
+      'For quantities that vary within countries (climate, terrain) use set_field instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -245,15 +356,9 @@ const mapTools: (ToolDef & { run: Executor })[] = [
           },
         },
         country: COUNTRY_PARAM,
+        ...COLOR_SCALE_PARAMS,
         scheme: { type: 'string', description: 'Default YlOrRd; use diverging schemes (RdBu, BrBG, …) for data centred on a midpoint' },
-        method: { type: 'string', enum: ['quantize', 'quantile', 'threshold', 'continuous'] },
-        classes: { type: 'integer', description: 'Number of classes for quantize/quantile (2-9, default 5)' },
-        breaks: { type: 'array', items: { type: 'number' }, description: 'Class breaks for method=threshold, ascending' },
-        domain: { type: 'array', items: { type: 'number' }, description: 'Optional [min, max] override' },
-        reverse: { type: 'boolean' },
         title: { type: 'string', description: 'Legend title, e.g. "GDP per capita (USD, 2024)"' },
-        unit: { type: 'string', description: 'Unit appended to legend numbers, e.g. "%", "$", "km²"' },
-        format: { type: 'string', description: 'd3-format specifier for legend numbers, e.g. ",.0f", ".1f", ".2s"' },
         no_data_color: { type: 'string' },
         show_no_data: { type: 'boolean', description: 'Show a "No data" legend entry (default true)' },
       },
@@ -277,22 +382,11 @@ const mapTools: (ToolDef & { run: Executor })[] = [
         else errors.push(res.error);
       }
       if (!Object.keys(values).length) return `No values could be matched to regions.${errorsNote(errors)}`;
-      const method = (['quantize', 'quantile', 'threshold', 'continuous'].includes(String(a.method)) ? a.method : 'quantize') as ChoroplethMethod;
-      const nums = (v: unknown) => (Array.isArray(v) ? v.map(toNum).filter((x): x is number => x !== undefined) : undefined);
-      const domain = nums(a.domain);
       let shown: string[] = [];
       const next = update((m) => {
         m.choropleth = {
           values,
-          scheme: optStr(a.scheme) ?? 'YlOrRd',
-          method,
-          classes: toNum(a.classes),
-          breaks: nums(a.breaks),
-          domain: domain?.length === 2 ? [domain[0], domain[1]] : undefined,
-          reverse: a.reverse === true,
-          title: optStr(a.title),
-          unit: optStr(a.unit),
-          format: optStr(a.format),
+          ...colorScaleArgs(a, { scheme: 'YlOrRd', method: 'quantize' }),
           noDataColor: validColor(a.no_data_color) ? String(a.no_data_color) : undefined,
           showNoData: a.show_no_data !== false,
         };
@@ -301,6 +395,314 @@ const mapTools: (ToolDef & { run: Executor })[] = [
       const legend = computeChoropleth(next.choropleth!, '#ccc').legend;
       const classes = legend.items?.map((i) => `${i.color} ${i.label}`).join('; ') ?? `gradient ${legend.gradient?.min} → ${legend.gradient?.max}`;
       return `Choropleth applied to ${Object.keys(values).length} regions. Legend: ${classes}.${shown.length ? ` Now drawing subdivisions of ${shown.join(', ')}.` : ''}${errorsNote(errors)}`;
+    },
+  },
+  {
+    name: 'set_field',
+    description:
+      'Colour the map with a continuous surface that ignores borders: temperature, rainfall, snowfall, elevation, pollution, sunshine, anything measured at places rather than per country. ' +
+      'Values are interpolated between samples and drawn as smooth filled contour bands with an automatic legend (replaces any previous field; drawn above country colours, below areas). ' +
+      'Give exactly one data source: `points` (scattered samples such as weather stations or cities, interpolated by inverse distance weighting; 30+ well-spread points look best), ' +
+      '`grid` (values on a regular lat/lon lattice) or `source: "elevation"` (built-in ETOPO 2022 relief: land elevation and ocean depth in metres, fetched for `bbox` or the current zoom_to framing; no data needed). ' +
+      'Schemes include Terrain (hypsometric land tints) and Bathymetry (ocean depths). Default method is continuous; use threshold + breaks for classed maps such as "land above 2000 m".',
+    parameters: {
+      type: 'object',
+      properties: {
+        points: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: '[[lon, lat, value], …]' },
+        grid: {
+          type: 'object',
+          properties: {
+            lats: { type: 'array', items: { type: 'number' } },
+            lons: { type: 'array', items: { type: 'number' } },
+            values: { type: 'array', items: { type: 'array', items: { type: ['number', 'null'] } }, description: 'One row per lat, one column per lon; null = no data' },
+          },
+          required: ['lats', 'lons', 'values'],
+        },
+        source: { type: 'string', enum: ['elevation'] },
+        bbox: { type: 'array', items: { type: 'number' }, description: 'Area to cover, [west, south, east, north]. Defaults to the data extent (for elevation, the current framing).' },
+        resolution: { type: 'number', description: 'Elevation only: degrees between samples (default: automatic, ~60k samples)' },
+        clip: {
+          type: 'string',
+          enum: CLIPS,
+          description: 'Where the field is drawn: land (default), ocean (e.g. sea temperature, depth) or none (both, e.g. elevation with bathymetry)',
+        },
+        ...COLOR_SCALE_PARAMS,
+        title: { type: 'string', description: 'Legend title, e.g. "Mean July temperature (°C, 1991–2020)"' },
+        opacity: { type: 'number', description: '0–1 (default 1); lower it to let country colours show through' },
+        power: { type: 'number', description: 'points only: inverse-distance power (default 2; higher = more local)' },
+        max_distance_km: { type: 'number', description: 'points only: leave places farther than this from every sample blank' },
+      },
+    },
+    run: async (a, signal) => {
+      const errors: string[] = [];
+      const elevation = a.source === 'elevation';
+      let data: FieldData | undefined;
+      let area = bbox(a.bbox);
+      if (a.bbox !== undefined && !area) errors.push('ignored invalid bbox (use [west, south, east, north])');
+      let origin: string | undefined;
+      if (elevation) {
+        if (!area && map().focus) {
+          // The framed area rarely matches the map's aspect ratio; fetch a margin around it.
+          const [w, s, e, n] = map().focus!;
+          const px = ((e < w ? e + 360 : e) - w) * 0.3;
+          const py = (n - s) * 0.3;
+          area = [w - px, Math.max(-90, s - py), e + px, Math.min(90, n + py)];
+          if (area[2] - area[0] >= 360) [area[0], area[2]] = [-180, 180];
+        }
+        area ??= [-180, -90, 180, 90];
+        const g = await loadData<{ lats: number[]; lons: number[]; values: (number | null)[][]; resolution: number; origin: string }>(
+          'elevation_grid',
+          { bbox: area, resolution: toNum(a.resolution) },
+          signal,
+        );
+        data = { kind: 'grid', lats: g.lats, lons: g.lons, values: g.values };
+        origin = `${g.origin}, ${round(g.resolution)}° samples`;
+      } else if (Array.isArray(a.points)) {
+        const points: [number, number, number][] = [];
+        for (const p of a.points as unknown[]) {
+          const ll = coord(p);
+          const v = toNum(Array.isArray(p) ? p[2] : p && typeof p === 'object' ? (p as Args).value : undefined);
+          if (ll && v !== undefined) points.push([round(ll[0]), round(ll[1]), v]);
+          else errors.push(`bad point ${JSON.stringify(p)}`);
+        }
+        if (points.length < 3) return `A field needs at least 3 valid [lon, lat, value] points.${errorsNote(errors)}`;
+        data = { kind: 'points', points, power: toNum(a.power), maxDistanceKm: toNum(a.max_distance_km) };
+      } else if (a.grid && typeof a.grid === 'object') {
+        const g = a.grid as Args;
+        const lats = numList(g.lats) ?? [];
+        const lons = numList(g.lons) ?? [];
+        const rows = Array.isArray(g.values) ? (g.values as unknown[]) : [];
+        if (lats.length < 2 || lons.length < 2) return 'grid needs at least 2 lats and 2 lons.';
+        if (rows.length !== lats.length || rows.some((r) => !Array.isArray(r) || r.length !== lons.length)) {
+          return `grid.values must have ${lats.length} rows (one per lat) of ${lons.length} values (one per lon).`;
+        }
+        data = { kind: 'grid', lats, lons, values: (rows as unknown[][]).map((r) => r.map((v) => toNum(v) ?? null)) };
+      } else {
+        return 'Give one data source: points, grid or source="elevation".';
+      }
+
+      const clip = clipMode(a.clip, 'land');
+      const scale = colorScaleArgs(a, { scheme: elevation ? (clip === 'ocean' ? 'Bathymetry' : 'Terrain') : 'Viridis', method: 'continuous' });
+      if (elevation && !scale.domain && !scale.breaks && !scale.colors && !optStr(a.scheme) && !optStr(a.method)) {
+        const vals = data.kind === 'grid' ? (data.values.flat().filter((v) => v !== null) as number[]) : [];
+        const [lo, hi] = [Math.min(...vals), Math.max(...vals)];
+        if (clip === 'land') scale.domain = [0, Math.max(hi, 1)];
+        else if (clip === 'ocean') scale.domain = [Math.min(lo, -1), 0];
+        else {
+          // Classic hypsometric + bathymetric tints
+          scale.method = 'threshold';
+          scale.breaks = [-6000, -4000, -2000, -200, 0, 200, 500, 1000, 2000, 3000, 4500];
+          scale.colors = ['#08254f', '#0d3c78', '#1b5c9e', '#3d85c0', '#8cc0e3', '#4f8f4a', '#8dba66', '#d9d991', '#d8a863', '#a8703f', '#8a6d5e', '#f4f4f2'];
+        }
+      }
+      const opacity = toNum(a.opacity);
+      update((m) => {
+        m.field = {
+          key: `f${Date.now().toString(36)}${fieldSeq++}`,
+          data: data!,
+          bbox: area,
+          clip,
+          opacity: opacity !== undefined ? Math.min(1, Math.max(0, opacity)) : undefined,
+          origin,
+          ...scale,
+        };
+      });
+      const r = renderField(map().field!);
+      if (!r.bands.length) return `The field has no data inside [${r.grid.bbox.map(round).join(', ')}]; check bbox and coordinates.${errorsNote(errors)}`;
+      const fmt = makeFormatter([r.min, r.max], scale.format, scale.unit);
+      const legend = r.scale.legend;
+      const classes = legend.items?.map((i) => `${i.color} ${i.label}`).join('; ') ?? `gradient ${legend.gradient?.min} → ${legend.gradient?.max}`;
+      const src = origin ?? (data.kind === 'points' ? `${data.points.length} points` : `${data.lats.length}×${data.lons.length} grid`);
+      return (
+        `Field drawn from ${src} over [${r.grid.bbox.map(round).join(', ')}] (${r.grid.nx}×${r.grid.ny} cells, ${Math.round(r.coverage * 100)}% with data), ` +
+        `values ${fmt(r.min)} to ${fmt(r.max)}, clip=${clip}. Legend: ${classes}.${errorsNote(errors)}`
+      );
+    },
+  },
+  {
+    name: 'draw_areas',
+    description:
+      'Draw zones that ignore administrative borders: deserts, mountain ranges, biomes, climate zones, permafrost, monsoon or tornado belts, flood plains, "within 500 km of X", ' +
+      'latitude bands (tropics, Arctic Circle)… Each item of `areas` is ONE of: `polygon` (outline as [[lon, lat], …], or a list of rings where the first is the outline and the rest are holes), ' +
+      '`polygons` (several separate outlines of the same zone), `bbox` [west, south, east, north] (follows parallels and meridians; west > east crosses the antimeridian) or `circle` {lon, lat, radius_km}. ' +
+      'Hand-drawn areas are clipped to land by default so rough outlines snap to coastlines; set smooth=true to round the corners of hand-drawn outlines. ' +
+      'Labelled areas go into the legend. Style keys given at the top level apply to every area and GeoJSON feature. ' +
+      'Prefer real geometry over hand-drawn guesses: `geojson_url` loads Polygon/LineString features from any public GeoJSON, filtered by `where` and coloured by a property with `color_by`. ' +
+      `Natural Earth (public domain) has ${NATURAL_EARTH}<file>.geojson with: ne_50m_geography_regions_polys (FEATURECLA: Desert, Range/mtn, Plateau, Basin, Plain, Tundra, Delta, Wetlands, Lowland, Valley…; NAME; SCALERANK), ` +
+      'ne_50m_glaciated_areas, ne_50m_antarctic_ice_shelves_polys, ne_50m_lakes, ne_50m_rivers_lake_centerlines (lines; SCALERANK), ne_10m_playas, ne_10m_reefs, ne_50m_geography_marine_polys, ' +
+      'ne_10m_bathymetry_K_200 (J_1000, I_2000, H_3000, G_4000, F_5000, E_6000… for deeper shelves). Use preview=true to list a file\'s properties without drawing.',
+    parameters: {
+      type: 'object',
+      properties: {
+        areas: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'Legend label' },
+              polygon: { type: 'array', items: { type: 'array' }, description: '[[lon, lat], …] or [[[lon, lat], …] outline, [[lon, lat], …] hole, …]' },
+              polygons: { type: 'array', items: { type: 'array' } },
+              bbox: { type: 'array', items: { type: 'number' } },
+              circle: { type: 'object', properties: { lon: { type: 'number' }, lat: { type: 'number' }, radius_km: { type: 'number' } }, required: ['lon', 'lat', 'radius_km'] },
+              ...AREA_STYLE_PARAMS,
+            },
+          },
+        },
+        geojson_url: { type: 'string' },
+        where: {
+          type: 'object',
+          description: 'Feature filter, case-insensitive: {"FEATURECLA": "Desert"} or {"FEATURECLA": ["Desert", "Plateau"], "SCALERANK": "<=3", "NAME": "~sahara"} (~ = contains)',
+        },
+        color_by: { type: 'string', description: 'Property whose values become separate colours and legend entries' },
+        colors: { type: 'object', description: 'Colour per color_by value, e.g. {"Desert": "#e3c27d"}; unlisted values get palette colours' },
+        preview: { type: 'boolean', description: 'Only describe the GeoJSON (feature count, property values); draw nothing' },
+        ...AREA_STYLE_PARAMS,
+        label: { type: 'string', description: 'Legend label for GeoJSON features when not using color_by' },
+        replace: { type: 'boolean', description: 'Remove all existing areas first' },
+        add_to_legend: { type: 'boolean', description: 'Default true' },
+        legend_title: { type: 'string' },
+      },
+    },
+    run: async (a, signal) => {
+      const errors: string[] = [];
+      const notes: string[] = [];
+      const style = (o: Args, base: AreaStyle = {}): AreaStyle => {
+        const opacity = toNum(o.opacity);
+        return {
+          label: optStr(o.label) ?? base.label,
+          fill: o.fill === 'none' ? 'none' : validColor(o.fill) ? String(o.fill).trim() : base.fill,
+          opacity: opacity !== undefined ? Math.min(1, Math.max(0, opacity)) : base.opacity,
+          stroke: validColor(o.stroke) ? String(o.stroke).trim() : base.stroke,
+          strokeWidth: toNum(o.stroke_width) ?? base.strokeWidth,
+          dashed: typeof o.dashed === 'boolean' ? o.dashed || undefined : base.dashed,
+          hatch: typeof o.hatch === 'boolean' ? o.hatch || undefined : base.hatch,
+          clip: o.clip !== undefined ? clipMode(o.clip, 'land') : base.clip,
+        };
+      };
+      const shared: AreaStyle = { ...style(a), label: undefined };
+      const pending: Omit<MapArea, 'id'>[] = [];
+      const existing = a.replace === true ? [] : map().areas;
+      const used = new Set(existing.map((x) => x.fill));
+      const palette = CATEGORICAL.Tableau10.filter((c) => !used.has(c));
+      let nextColor = 0;
+      const autoColor = () => palette[nextColor++ % palette.length] ?? CATEGORICAL.Tableau10[nextColor % 10];
+
+      for (const [i, ar] of (Array.isArray(a.areas) ? (a.areas as Args[]) : []).entries()) {
+        const what = optStr(ar.label) ? `"${optStr(ar.label)}"` : `area ${i + 1}`;
+        const smooth = typeof ar.smooth === 'boolean' ? ar.smooth : a.smooth === true;
+        const geoms: AreaGeometry[] = [];
+        const addPolygon = (v: unknown) => {
+          const r = rings(v);
+          const p = r && polygonFromRings(r, smooth);
+          if (p) geoms.push(p);
+          else errors.push(`${what}: a polygon needs at least 3 [lon, lat] points`);
+        };
+        if (ar.polygon !== undefined) addPolygon(ar.polygon);
+        if (Array.isArray(ar.polygons)) ar.polygons.forEach(addPolygon);
+        if (ar.bbox !== undefined) {
+          const b = bbox(ar.bbox);
+          const p = b && bboxPolygon(b);
+          if (p) geoms.push(p);
+          else errors.push(`${what}: bbox must be [west, south, east, north]`);
+        }
+        if (ar.circle !== undefined) {
+          const c = (ar.circle ?? {}) as Args;
+          const pt = coord(c);
+          const radius = toNum(c.radius_km);
+          if (pt && radius && radius > 0) geoms.push(circlePolygon(pt[0], pt[1], radius));
+          else errors.push(`${what}: circle needs lon, lat and a positive radius_km`);
+        }
+        if (!geoms.length) {
+          if (ar.polygon === undefined && ar.polygons === undefined && ar.bbox === undefined && ar.circle === undefined) {
+            errors.push(`${what}: give polygon, polygons, bbox or circle`);
+          }
+          continue;
+        }
+        const s = style(ar, shared);
+        pending.push({ geometry: mergeGeometries(geoms)[0], ...s, clip: s.clip ?? 'land', fill: s.fill ?? (s.hatch || !s.stroke ? autoColor() : 'none') });
+      }
+
+      const url = optStr(a.geojson_url);
+      if (url) {
+        const colorBy = optStr(a.color_by);
+        const res = await loadData<GeojsonResult>(
+          'load_geojson',
+          { url, where: a.where, keep: [colorBy, 'name'].filter(Boolean), preview: a.preview === true },
+          signal,
+        );
+        const props = JSON.stringify(res.properties);
+        const summary = `${res.matched} of ${res.total} features match${a.where ? ` ${JSON.stringify(a.where)}` : ''} (${res.geometryTypes.join(', ') || 'none'}). Properties: ${props}`;
+        if (a.preview === true) return `GeoJSON preview: ${summary}`;
+        if (!res.features.length) errors.push(`no drawable GeoJSON features: ${summary}`);
+        const prop = (p: Record<string, unknown>, key: string) => p[Object.keys(p).find((k) => k.toLowerCase() === key.toLowerCase()) ?? key];
+        const groups = new Map<string, { geoms: AreaGeometry[]; names: string[] }>();
+        for (const f of res.features) {
+          const g = normalizeGeometry(f.geometry);
+          if (!g) continue;
+          const key = colorBy ? String(prop(f.properties, colorBy) ?? 'Other') : '';
+          let group = groups.get(key);
+          if (!group) groups.set(key, (group = { geoms: [], names: [] }));
+          group.geoms.push(g);
+          const name = prop(f.properties, 'name');
+          if (name) group.names.push(String(name));
+        }
+        const colorMap = a.colors && typeof a.colors === 'object' ? (a.colors as Args) : {};
+        const lookup = (key: string) => {
+          const hit = Object.keys(colorMap).find((k) => k.toLowerCase() === key.toLowerCase());
+          return hit && validColor(colorMap[hit]) ? String(colorMap[hit]).trim() : undefined;
+        };
+        const described: string[] = [];
+        for (const [key, group] of groups) {
+          const color = (colorBy ? lookup(key) : undefined) ?? shared.fill ?? autoColor();
+          const label = colorBy ? key : optStr(a.label);
+          for (const geometry of mergeGeometries(group.geoms)) {
+            const line = geometry.type === 'LineString' || geometry.type === 'MultiLineString';
+            pending.push({
+              geometry,
+              ...shared,
+              label,
+              fill: line ? 'none' : color,
+              stroke: line ? (colorBy ? color : (shared.stroke ?? color)) : shared.stroke,
+              strokeWidth: line ? (shared.strokeWidth ?? 1.2) : shared.strokeWidth,
+              clip: shared.clip ?? 'none',
+            });
+          }
+          const names = [...new Set(group.names)];
+          described.push(
+            `${label ? `"${label}" ` : ''}${group.geoms.length} feature(s)${names.length ? `: ${names.slice(0, 8).join(', ')}${names.length > 8 ? ', …' : ''}` : ''}`,
+          );
+        }
+        if (groups.size) notes.push(`GeoJSON: ${described.join('; ')}.${res.truncated ? ' Only the first 5000 features were used.' : ''}${res.skipped ? ` Skipped ${res.skipped} point feature(s); use add_markers for points.` : ''}`);
+      }
+
+      if (!pending.length) return `Nothing drawn.${errorsNote(errors)}`;
+      const added: string[] = [];
+      update((m) => {
+        if (a.replace === true) m.areas = [];
+        for (const p of pending) {
+          const id = nextId('a', m.areas);
+          m.areas.push({ id, ...p });
+          added.push(id);
+        }
+        if (a.add_to_legend !== false) {
+          const labelled = pending.filter((p) => p.label);
+          if (labelled.length) {
+            m.legend ??= { items: [] };
+            for (const p of labelled) {
+              const color = p.fill && p.fill !== 'none' ? p.fill : (p.stroke ?? '#888');
+              const existingItem = m.legend.items.find((it) => it.label === p.label);
+              if (existingItem) Object.assign(existingItem, { color, hatch: p.hatch });
+              else m.legend.items.push({ color, label: p.label!, ...(p.hatch ? { hatch: true } : {}) });
+            }
+          }
+          if (optStr(a.legend_title)) (m.legend ??= { items: [] }).title = optStr(a.legend_title);
+        }
+      });
+      const list = added.map((id, k) => {
+        const p = pending[k];
+        return `${id}${p.label ? ` "${p.label}"` : ''} ${p.geometry.type} ${vertexCount(p.geometry)} pts clip=${p.clip ?? 'none'}`;
+      });
+      return `Drew ${added.length} area(s): ${list.slice(0, 20).join('; ')}${list.length > 20 ? '; …' : ''}.${notes.length ? ' ' + notes.join(' ') : ''}${errorsNote(errors)}`;
     },
   },
   {
@@ -721,14 +1123,14 @@ const mapTools: (ToolDef & { run: Executor })[] = [
   {
     name: 'remove_elements',
     description:
-      'Remove things from the map. `what` lists element kinds to clear: colors, choropleth, labels, markers, lines, legend, title, subdivisions, style, focus. ' +
-      'With `ids`, only those elements are removed (label/marker/line ids like l3, m1, ln2, or region refs for colors, or country ids for subdivisions).',
+      'Remove things from the map. `what` lists element kinds to clear: colors, choropleth, field, areas, labels, markers, lines, legend, title, subdivisions, style, focus. ' +
+      'With `ids`, only those elements are removed (area/label/marker/line ids like a2, l3, m1, ln2, or region refs for colors, or country ids for subdivisions).',
     parameters: {
       type: 'object',
       properties: {
         what: {
           type: 'array',
-          items: { type: 'string', enum: ['colors', 'choropleth', 'labels', 'markers', 'lines', 'legend', 'title', 'subdivisions', 'style', 'focus'] },
+          items: { type: 'string', enum: ['colors', 'choropleth', 'field', 'areas', 'labels', 'markers', 'lines', 'legend', 'title', 'subdivisions', 'style', 'focus'] },
         },
         ids: { type: 'array', items: { type: 'string' } },
       },
@@ -746,6 +1148,8 @@ const mapTools: (ToolDef & { run: Executor })[] = [
           else m.regions = {};
         }
         if (what.includes('choropleth')) m.choropleth = undefined;
+        if (what.includes('field')) m.field = undefined;
+        if (what.includes('areas')) m.areas = keep(m.areas);
         if (what.includes('labels')) m.labels = keep(m.labels);
         if (what.includes('markers')) m.markers = keep(m.markers);
         if (what.includes('lines')) m.lines = keep(m.lines);
@@ -875,6 +1279,24 @@ export function summarizeMap(m: MapState) {
       unit: cp.unit,
       values: Object.fromEntries(Object.entries(cp.values).slice(0, 60)),
     },
+    field: m.field && {
+      data: m.field.origin ?? (m.field.data.kind === 'points' ? `${m.field.data.points.length} points` : `${m.field.data.lats.length}×${m.field.data.lons.length} grid`),
+      bbox: m.field.bbox,
+      clip: m.field.clip,
+      scheme: m.field.colors ? undefined : m.field.scheme,
+      colors: m.field.colors,
+      method: m.field.method,
+      breaks: m.field.breaks,
+      domain: m.field.domain,
+      title: m.field.title,
+      unit: m.field.unit,
+      opacity: m.field.opacity,
+    },
+    areas: m.areas.map(
+      (a) =>
+        `${a.id}: ${a.label ?? ''} ${a.geometry.type} ${vertexCount(a.geometry)} pts fill=${a.fill ?? 'none'}` +
+        `${a.hatch ? ' hatched' : ''}${a.opacity !== undefined ? ` opacity=${a.opacity}` : ''}${a.stroke ? ` stroke=${a.stroke}` : ''} clip=${a.clip ?? 'none'}`,
+    ),
     subdivisions: m.subdivisions,
     labels: m.labels.map((l) => `${l.id}: ${l.text.replace(/\n/g, ' / ')}`),
     markers: m.markers.map((k) => `${k.id}: ${k.label ?? ''} (${k.lon}, ${k.lat})`),
@@ -897,6 +1319,8 @@ export function briefMapState(m: MapState): string {
   const colored = Object.keys(m.regions).length;
   if (colored) parts.push(`${colored} regions manually coloured`);
   if (m.choropleth) parts.push(`choropleth on ${Object.keys(m.choropleth.values).length} regions (${m.choropleth.title ?? 'untitled'})`);
+  if (m.field) parts.push(`field (${m.field.title ?? m.field.origin ?? 'untitled'})`);
+  if (m.areas.length) parts.push(`${m.areas.length} areas`);
   if (m.subdivisions.length) parts.push(`subdivisions shown for ${m.subdivisions.join(',')}`);
   if (m.labels.length) parts.push(`${m.labels.length} labels`);
   if (m.markers.length) parts.push(`${m.markers.length} markers`);

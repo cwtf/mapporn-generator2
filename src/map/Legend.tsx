@@ -5,7 +5,7 @@ import { MAP_HEIGHT as H, MAP_WIDTH as W, type MapState } from './types';
 
 type Row =
   | { kind: 'title'; text: string }
-  | { kind: 'item'; color: string; text: string }
+  | { kind: 'item'; color: string; text: string; hatch?: boolean }
   | { kind: 'gradient'; stops: string[]; min: string; max: string }
   | { kind: 'gap' };
 
@@ -33,25 +33,27 @@ function toSvgPoint(el: SVGElement, clientX: number, clientY: number): DOMPoint 
 }
 
 /**
- * The map legend: choropleth classes plus manual entries. Drag it to move, drag the corner
+ * The map legend: automatic scales (choropleth, field) plus manual entries. Drag it to move, drag the corner
  * grip to resize, double-click to snap back to its corner. Position is stored in map units
  * so it is saved with the chat and appears the same in exports.
  */
-export function Legend({ map, style, choro, top, bottom }: { map: MapState; style: ResolvedStyle; choro?: ChoroplethLegend; top: number; bottom: number }) {
+export function Legend({ map, style, auto, top, bottom }: { map: MapState; style: ResolvedStyle; auto: ChoroplethLegend[]; top: number; bottom: number }) {
   const [live, setLive] = useState<Box | null>(null);
   const drag = useRef<DragState | null>(null);
 
   const rows: Row[] = [];
-  if (choro && (choro.items || choro.gradient)) {
-    if (choro.title) rows.push({ kind: 'title', text: choro.title });
-    if (choro.gradient) rows.push({ kind: 'gradient', ...choro.gradient });
-    for (const it of choro.items ?? []) rows.push({ kind: 'item', color: it.color, text: it.label });
-    if (choro.noData) rows.push({ kind: 'item', color: choro.noData, text: 'No data' });
+  for (const scale of auto) {
+    if (!scale.items && !scale.gradient) continue;
+    if (rows.length) rows.push({ kind: 'gap' });
+    if (scale.title) rows.push({ kind: 'title', text: scale.title });
+    if (scale.gradient) rows.push({ kind: 'gradient', ...scale.gradient });
+    for (const it of scale.items ?? []) rows.push({ kind: 'item', color: it.color, text: it.label });
+    if (scale.noData) rows.push({ kind: 'item', color: scale.noData, text: 'No data' });
   }
   if (map.legend && (map.legend.items.length || map.legend.title)) {
     if (rows.length) rows.push({ kind: 'gap' });
     if (map.legend.title) rows.push({ kind: 'title', text: map.legend.title });
-    for (const it of map.legend.items) rows.push({ kind: 'item', color: it.color, text: it.label });
+    for (const it of map.legend.items) rows.push({ kind: 'item', color: it.color, text: it.label, hatch: it.hatch });
   }
   if (!rows.length) return null;
 
@@ -153,7 +155,23 @@ export function Legend({ map, style, choro, top, bottom }: { map: MapState; styl
         if (r.kind === 'item')
           return (
             <g key={i}>
-              <rect x={PAD} y={y + 3} width={24} height={16} rx={2} fill={r.color} stroke={style.border} strokeOpacity={0.5} />
+              {r.hatch && (
+                <defs>
+                  <pattern id={`legend-hatch-${i}`} patternUnits="userSpaceOnUse" width={6} height={6} patternTransform="rotate(45)">
+                    <rect width={2.2} height={6} fill={r.color} />
+                  </pattern>
+                </defs>
+              )}
+              <rect
+                x={PAD}
+                y={y + 3}
+                width={24}
+                height={16}
+                rx={2}
+                fill={r.hatch ? `url(#legend-hatch-${i})` : r.color}
+                stroke={style.border}
+                strokeOpacity={0.5}
+              />
               <text x={PAD + 34} y={y + 16} fontSize={14} fill={style.textColor}>
                 {r.text}
               </text>
